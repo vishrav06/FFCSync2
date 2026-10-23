@@ -1,0 +1,11 @@
+course_code,title,credits_tenths,bucket,prereqs
+CSE1001,Problem Solving and Programming,30,PC,
+CSE2001,Data Structures and Algorithms,40,PC,CSE1001
+CSE2005,Operating Systems,40,PC,CSE2001
+CSE3001,Database Systems,40,PC,CSE2001
+CSE3002,Computer Networks,40,PC,CSE2005
+CSE4001,Parallel and Distributed Computing,30,PE,CSE2005
+CSE4019,Image Processing,30,PE,
+MAT2001,Statistics for Engineers,40,UE,
+HUM1021,Ethics and Values,20,UE,
+ENG1011,Effective English,20,UE,

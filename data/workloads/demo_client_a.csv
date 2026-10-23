@@ -1,0 +1,3 @@
+# Demo: client A wants the last seat of CSE2005-B1.
+request_id,op,student_id,section_id
+A01,ADD,S001,CSE2005-B1
