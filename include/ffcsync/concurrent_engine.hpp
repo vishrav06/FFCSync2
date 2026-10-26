@@ -27,6 +27,7 @@
 #include <cstdint>
 #include <functional>
 #include <mutex>
+#include <span>
 #include <thread>
 #include <vector>
 
@@ -55,7 +56,11 @@ using Completion = std::function<void(const RegistrationResult&, std::uint64_t s
 
 class ConcurrentEngine {
 public:
-    ConcurrentEngine(const Catalog& catalog, EngineOptions options);
+    // on_batch_end (committer mode only): called by the committer thread after
+    // it has run the completion of every request in a batch, e.g. so the
+    // server can flush the replies it buffered during that batch.
+    ConcurrentEngine(const Catalog& catalog, EngineOptions options,
+                     std::function<void()> on_batch_end = {});
     ~ConcurrentEngine();
 
     ConcurrentEngine(const ConcurrentEngine&) = delete;
@@ -65,6 +70,11 @@ public:
     // the request, blocking while the queue is full. Returns the seq, or 0 if
     // the engine has been shut down (the request is then not processed).
     std::uint64_t submit(const RegistrationRequest& req, Completion on_done);
+
+    // Admits several requests under one acquisition of the admission mutex, so
+    // they receive consecutive seqs in span order. Each request gets its own
+    // copy of `on_done`. Returns the first seq, or 0 if shut down (or empty).
+    std::uint64_t submit_batch(std::span<const RegistrationRequest> reqs, const Completion& on_done);
 
     // Stops admission, lets the workers drain the queue, joins them. Idempotent.
     void shutdown();
@@ -93,6 +103,7 @@ private:
 
     const Catalog& catalog_;
     const EngineOptions options_;
+    const std::function<void()> on_batch_end_;
 
     mutable std::mutex admission_mu_;   // guards next_seq_, admissions_, closed_
     std::uint64_t next_seq_ = 1;

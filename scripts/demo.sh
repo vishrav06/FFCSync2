@@ -4,10 +4,11 @@
 #   2. one invalid request (rule violation) and one malformed message
 #   3. two client PROCESSES racing for the last seat of CSE2005-B1
 # then graceful shutdown, invariant check and oracle comparison.
-# Usage: scripts/demo.sh [build-dir]   (default: build)
+# Usage: scripts/demo.sh [build-dir] [gate|committer]   (defaults: build, gate)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 BUILD=${1:-build}
+MODE=${2:-gate}
 SOCK=/tmp/ffcsync_demo.sock
 OUT=results/demo
 rm -rf "$OUT"
@@ -25,8 +26,14 @@ server_log() {
     SHOWN=$total
 }
 
-step "start server: 2 workers, queue capacity 4, verbose thread/queue log"
-"$BUILD/ffcsync_server" --data data --socket "$SOCK" --workers 2 --queue-capacity 4 --out "$OUT/server" --verbose > "$LOG" 2>&1 &
+if [ "$MODE" = committer ]; then
+    step "start server: single committer, queue capacity 4, verbose admission/commit log"
+    SERVER_FLAGS=(--workers 1 --mode committer)
+else
+    step "start server: 2 workers, queue capacity 4, verbose thread/queue log"
+    SERVER_FLAGS=(--workers 2 --mode gate)
+fi
+"$BUILD/ffcsync_server" --data data --socket "$SOCK" "${SERVER_FLAGS[@]}" --queue-capacity 4 --out "$OUT/server" --verbose > "$LOG" 2>&1 &
 SERVER_PID=$!
 trap 'kill $SERVER_PID 2>/dev/null || true' EXIT
 for _ in $(seq 100); do [ -S "$SOCK" ] && break; sleep 0.05; done

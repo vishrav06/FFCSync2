@@ -190,4 +190,59 @@ TEST_CASE("randomised workloads match the sequential reference") {
     }
 }
 
+TEST_CASE("batched submissions get consecutive seqs and match the sequential reference") {
+    std::vector<StudentId> students;
+    for (const auto& [id, s] : catalog().students) students.push_back(id);
+    std::vector<SectionId> sections;
+    for (const auto& [id, s] : catalog().sections) sections.push_back(id);
+
+    for (const EngineConfig& cfg : kConfigs) {
+        CAPTURE(cfg.workers);
+        CAPTURE(to_string(cfg.mode));
+        for (unsigned rep = 0; rep < 50; ++rep) {
+            CAPTURE(rep);
+            std::mt19937 rng(rep * 104729u + static_cast<unsigned>(cfg.workers));
+            ConcurrentEngine engine(catalog(), options_for(cfg, 8));
+            std::mutex mu;
+            std::map<std::uint64_t, RegistrationResult> delivered;
+            std::vector<std::vector<std::vector<RegistrationRequest>>> batches(4);
+            for (unsigned t = 0; t < batches.size(); ++t) {
+                for (int b = 0; b < 10; ++b) {
+                    std::vector<RegistrationRequest> batch(1 + rng() % 20);   // may exceed capacity
+                    for (std::size_t i = 0; i < batch.size(); ++i) {
+                        batch[i] = RegistrationRequest{
+                            std::to_string(t) + "-" + std::to_string(b) + "-" + std::to_string(i),
+                            rng() % 4 == 0 ? Op::Drop : Op::Add, students[rng() % students.size()],
+                            sections[rng() % sections.size()]};
+                    }
+                    batches[t].push_back(std::move(batch));
+                }
+            }
+            std::latch start(static_cast<std::ptrdiff_t>(batches.size()));
+            std::vector<std::thread> threads;
+            for (const auto& mine : batches) {
+                threads.emplace_back([&, &mine = mine] {
+                    start.arrive_and_wait();
+                    for (const auto& batch : mine) {
+                        const auto first = engine.submit_batch(
+                            batch, [&](const RegistrationResult& res, std::uint64_t) {
+                                std::lock_guard lock(mu);
+                                CHECK(delivered.emplace(res.seq, res).second);
+                            });
+                        REQUIRE(first > 0);
+                        // The batch occupies first .. first+size-1 in span order.
+                        const auto admitted = engine.admissions();
+                        for (std::size_t i = 0; i < batch.size(); ++i) {
+                            CHECK(admitted[first - 1 + i].request.request_id == batch[i].request_id);
+                        }
+                    }
+                });
+            }
+            for (auto& t : threads) t.join();
+            engine.shutdown();
+            check_matches_oracle(engine, delivered);
+        }
+    }
+}
+
 }  // TEST_SUITE

@@ -5,7 +5,8 @@
 // Raw payload (to demonstrate MALFORMED handling):
 //   ffcsync_client [--socket PATH] --raw "REQ|x|BOGUS|S001|CSE2005-A1"
 // Workload file (pipelined: a sender thread keeps up to --max-inflight
-// requests outstanding while the main thread receives responses):
+// requests outstanding, sending every request it may send with one write,
+// while the main thread receives responses through a buffered reader):
 //   ffcsync_client [--socket PATH] --requests FILE [--out FILE] [--max-inflight K]
 //                  [--metrics FILE --label NAME] [--quiet]
 //
@@ -86,21 +87,35 @@ int run_workload(int fd, const cli::Args& args) {
     std::mutex sent_mu;   // guards Sample::sent (written by sender, read by receiver)
     const auto start = Clock::now();
 
+    // The sender waits for one free slot, then also takes every other slot
+    // that is free right now and sends all those requests with one write.
     std::thread sender([&] {
-        for (auto& s : samples) {
+        std::string bytes;
+        std::size_t next = 0;
+        while (next < samples.size()) {
             window.acquire();
+            std::size_t end = next + 1;
+            while (end < samples.size() && window.try_acquire()) ++end;
+            bytes.clear();
             {
                 std::lock_guard lock(sent_mu);
-                s.sent = Clock::now();
+                const auto now = Clock::now();
+                for (std::size_t i = next; i < end; ++i) samples[i].sent = now;
             }
-            if (!ipc::write_frame(fd, ipc::encode_request(s.req))) break;
+            for (std::size_t i = next; i < end; ++i) {
+                ipc::append_frame(bytes, ipc::encode_request(samples[i].req));
+            }
+            if (!ipc::write_all(fd, bytes)) break;
+            next = end;
         }
     });
 
+    // Buffered: one read() can deliver many responses.
+    ipc::FrameReader in(fd);
     std::size_t received = 0;
     std::string payload;
     while (received < samples.size()) {
-        if (ipc::read_frame(fd, payload) != ipc::ReadStatus::Ok) break;
+        if (in.next(payload) != ipc::ReadStatus::Ok) break;
         const auto now = Clock::now();
         auto resp = ipc::decode_response(payload);
         auto it = resp ? index.find(resp->request_id) : index.end();

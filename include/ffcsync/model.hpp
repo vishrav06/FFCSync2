@@ -34,7 +34,7 @@ enum class Op { Add, Drop };
 enum class Status { Accepted, Rejected };
 
 // Rejection reasons. The registration rules are evaluated in this order and
-// the first failing rule is reported (see docs/SCOPE.md).
+// the first failing rule is reported (see README.md).
 enum class Reason {
     Ok,
     Malformed,

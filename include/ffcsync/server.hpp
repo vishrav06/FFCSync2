@@ -62,10 +62,16 @@ private:
     struct Connection;
 
     void reader_loop(std::shared_ptr<Connection> conn);
+    Completion reply_to(std::shared_ptr<Connection> conn);
+    void flush_replies();
     void write_outputs() const;
 
     const Catalog& catalog_;
     const ServerOptions options_;
+    // Committer mode: connections with replies buffered during the current
+    // batch. Only the committer thread touches it (declared before engine_,
+    // whose committer thread uses it).
+    std::vector<std::shared_ptr<Connection>> pending_replies_;
     ConcurrentEngine engine_;
 
     int listen_fd_ = -1;

@@ -1,4 +1,4 @@
-# One request per registration rule (expected outcomes: docs/TESTING.md).
+# One request per registration rule (expected outcomes: data/workloads/golden/basic.results.csv).
 request_id,op,student_id,section_id
 R01,ADD,S001,CSE2005-A1
 R02,ADD,S003,CSE2005-A1

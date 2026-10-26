@@ -1,6 +1,6 @@
 // Loading the catalog and request files from plain CSV.
 //
-// CSV dialect (kept deliberately simple, see docs/SCOPE.md):
+// CSV dialect (kept deliberately simple, see README.md):
 //   * the first non-blank line is a header and is checked against the expected columns
 //   * fields are separated by ',' and trimmed; quoting is not supported
 //   * list-valued fields (slots, prerequisites, completed courses) use ';'
