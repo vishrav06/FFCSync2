@@ -59,3 +59,5 @@ target_compile_definitions(ffcsync_tests PRIVATE FFCSYNC_SOURCE_DIR="${CMAKE_SOU
 add_test(NAME unit_and_concurrency_tests COMMAND ffcsync_tests)
 add_test(NAME integration_two_process
          COMMAND ${CMAKE_SOURCE_DIR}/tests/integration.sh ${CMAKE_BINARY_DIR} ${CMAKE_SOURCE_DIR})
+add_test(NAME integration_two_process_committer
+         COMMAND ${CMAKE_SOURCE_DIR}/tests/integration.sh ${CMAKE_BINARY_DIR} ${CMAKE_SOURCE_DIR} committer)

@@ -107,13 +107,15 @@ TEST_CASE("request and response codec") {
 }
 
 TEST_CASE("server answers every request with the oracle's result") {
-    for (int workers : {0, 2}) {
+    for (auto [workers, mode] : {std::pair{0, CommitMode::Gate}, std::pair{2, CommitMode::Gate},
+                                 std::pair{1, CommitMode::Committer}}) {
         CAPTURE(workers);
+        CAPTURE(to_string(mode));
         auto requests = load_requests(data_dir() / "workloads" / "basic.csv");
         RegistrationEngine oracle(catalog());
         auto expected = oracle.run(requests);
 
-        TestServer ts(catalog(), workers);
+        TestServer ts(catalog(), workers, 16, mode);
         TestClient c(ts.path());
         REQUIRE(c.ok());
         for (std::size_t i = 0; i < requests.size(); ++i) {
@@ -159,9 +161,11 @@ TEST_CASE("oversized frame gets MALFORMED and the connection is closed") {
 }
 
 TEST_CASE("client disconnect does not break the server") {
-    for (int workers : {0, 2}) {
+    for (auto [workers, mode] : {std::pair{0, CommitMode::Gate}, std::pair{2, CommitMode::Gate},
+                                 std::pair{1, CommitMode::Committer}}) {
         CAPTURE(workers);
-        TestServer ts(catalog(), workers);
+        CAPTURE(to_string(mode));
+        TestServer ts(catalog(), workers, 16, mode);
         {
             TestClient c(ts.path());
             // Send without reading the response, then vanish.

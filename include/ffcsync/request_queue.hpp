@@ -2,6 +2,7 @@
 //
 //   push() blocks while the queue is full   -> back-pressure on producers
 //   pop()  blocks while the queue is empty  -> idle workers sleep
+//   pop_batch() like pop(), but takes every queued item (up to a maximum)
 //   close() wakes everyone: further pushes fail, pops drain what is left
 //          and then return std::nullopt so workers can exit.
 //
@@ -16,6 +17,7 @@
 #include <mutex>
 #include <optional>
 #include <stdexcept>
+#include <vector>
 
 namespace ffcsync {
 
@@ -51,6 +53,22 @@ public:
         lock.unlock();
         not_full_.notify_one();
         return item;
+    }
+
+    // Blocks while empty, then moves up to `max` items (FIFO order) into `out`.
+    // Returns false once the queue is closed and drained (`out` is then empty).
+    bool pop_batch(std::vector<T>& out, std::size_t max) {
+        out.clear();
+        std::unique_lock lock(mu_);
+        not_empty_.wait(lock, [&] { return closed_ || !items_.empty(); });
+        if (items_.empty()) return false;
+        while (!items_.empty() && out.size() < max) {
+            out.push_back(std::move(items_.front()));
+            items_.pop_front();
+        }
+        lock.unlock();
+        not_full_.notify_all();   // several slots may have been freed
+        return true;
     }
 
     void close() {

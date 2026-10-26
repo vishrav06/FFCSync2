@@ -91,3 +91,17 @@ That is the price of a simple, provably FCFS-correct design. A faster design wou
 | Oracle replay | `ffcsync_seq replay` | Re-runs a server admission log for comparison |
 | Sequential server | `ffcsync_server --workers 0` | IPC with inline processing under the admission mutex (build-plan phase 3) |
 | Concurrent server | `ffcsync_server --workers N` | Queue + worker pool + ordered commit gate (phases 4–5) |
+| Single committer | `ffcsync_server --mode committer` | Queue + **one** committer thread that commits batches; no gate (see §6) |
+
+## 6. Single-committer mode
+
+`--mode committer` keeps the reader threads, the admission point and the bounded queue unchanged. It replaces the worker pool and the `CommitGate` with one committer thread, which is the only thread that ever touches `RegistrationState`.
+
+1. `BoundedQueue::pop_batch()` waits until the queue is non-empty, then takes **every** queued job (up to the capacity) in FIFO order.
+2. Under `commit_mu_`, the committer runs `check_static()` and `decide_and_commit()` for each job in turn.
+3. It releases the lock and sends every reply in the batch.
+
+**Why no gate is needed.** A single consumer of a FIFO queue cannot reorder jobs, and queue order is seq order (§2, step 3). The commits therefore happen in exactly the admission-log order, so the oracle replay argument of §3 applies unchanged. `commit_mu_` exists only so that `state()` and `results()` snapshots taken while the committer runs are consistent; nobody else contends for it.
+
+**Why batch.** Under load, one wake-up of the committer pays for many requests, instead of one condition-variable hand-off and one `notify_all` per commit. With few requests in flight, batches have size 1, and the mode behaves like `--workers 1`. The reader → committer hand-off remains, so it cannot beat the inline `--workers 0` server at low load. See `BENCHMARK.md`.
+

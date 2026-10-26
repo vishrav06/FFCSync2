@@ -34,10 +34,17 @@ def main():
     groups = defaultdict(list)
     for r in rows:
         if r["mode"] == "server":
-            groups[(int(r["requests"]), int(r["workers"]))].append(r)
+            groups[(int(r["requests"]), r["workers"])].append(r)
     sizes = sorted({k[0] for k in groups})
-    workers = sorted({k[1] for k in groups})
-    labels = [("sequential server" if w == 0 else f"{w} worker" + ("s" if w > 1 else "")) for w in workers]
+    # Numeric worker counts first, then the committer mode.
+    workers = sorted({k[1] for k in groups}, key=lambda w: (not w.isdigit(), int(w) if w.isdigit() else 0))
+
+    def label(w):
+        if w == "committer":
+            return "committer"
+        return "sequential server" if w == "0" else f"{w} worker" + ("s" if int(w) > 1 else "")
+
+    labels = [label(w) for w in workers]
     width = 0.8 / len(sizes)
 
     def bar_chart(field, ylabel, title, filename):

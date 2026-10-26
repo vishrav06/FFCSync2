@@ -16,6 +16,12 @@
 // workers == 0 selects the sequential server mode (build-plan phase 3): the
 // request is processed inline in the calling thread while admission_mu_ is
 // held. No queue, no worker threads.
+//
+// CommitMode::Committer replaces the worker pool and the CommitGate with ONE
+// committer thread that owns the state. It takes every queued job at once
+// (pop_batch), commits them in queue order (= seq order), then sends the
+// replies. A single consumer of a FIFO queue cannot reorder, so no gate is
+// needed; batching amortises the wake-up cost over many requests.
 #pragma once
 
 #include <cstdint>
@@ -30,11 +36,19 @@
 
 namespace ffcsync {
 
+enum class CommitMode {
+    Gate,        // N worker threads, commits ordered by CommitGate
+    Committer,   // one committer thread, batched; `workers` (if > 0) is ignored
+};
+
 struct EngineOptions {
     int workers = 4;                  // 0 = sequential inline processing
     std::size_t queue_capacity = 64;
     bool verbose = false;             // per-request thread/queue log on stderr
+    CommitMode mode = CommitMode::Gate;
 };
+
+const char* to_string(CommitMode mode);
 
 // Called exactly once per admitted request, from the thread that committed it.
 using Completion = std::function<void(const RegistrationResult&, std::uint64_t server_us)>;
@@ -70,6 +84,10 @@ private:
     };
 
     void worker_loop(int worker_id);
+    void committer_loop();
+    bool committer_mode() const {
+        return options_.workers > 0 && options_.mode == CommitMode::Committer;
+    }
     RegistrationResult commit(std::uint64_t seq, const RegistrationRequest& req, Reason static_verdict);
     void log(const std::string& line);
 
@@ -84,8 +102,13 @@ private:
     BoundedQueue<Job> queue_;
     CommitGate gate_;
 
-    // Mutable registration state. Guarded by gate_ (worker mode) or by
-    // admission_mu_ (inline mode). Never touched outside those.
+    // Held by the committer thread while it commits a batch, so snapshots
+    // taken concurrently see a consistent state (committer mode only).
+    mutable std::mutex commit_mu_;
+
+    // Mutable registration state. Guarded by gate_ (worker mode), by
+    // admission_mu_ (inline mode) or by commit_mu_ (committer mode).
+    // Never touched outside those.
     RegistrationState state_;
     std::vector<RegistrationResult> results_;
 

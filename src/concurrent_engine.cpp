@@ -19,12 +19,20 @@ std::uint64_t micros_since(Clock::time_point t0) {
 
 }  // namespace
 
+const char* to_string(CommitMode mode) {
+    return mode == CommitMode::Committer ? "committer" : "gate";
+}
+
 ConcurrentEngine::ConcurrentEngine(const Catalog& catalog, EngineOptions options)
     : catalog_(catalog),
       options_(options),
       queue_(options.queue_capacity),
       state_(RegistrationState::empty_for(catalog)) {
     if (options_.workers < 0) throw std::invalid_argument("workers must be >= 0");
+    if (committer_mode()) {
+        workers_.emplace_back(&ConcurrentEngine::committer_loop, this);
+        return;
+    }
     for (int i = 0; i < options_.workers; ++i) {
         workers_.emplace_back(&ConcurrentEngine::worker_loop, this, i + 1);
     }
@@ -81,6 +89,37 @@ void ConcurrentEngine::worker_loop(int worker_id) {
     }
 }
 
+void ConcurrentEngine::committer_loop() {
+    struct Done {
+        RegistrationResult result;
+        std::uint64_t us;
+    };
+    std::vector<Job> batch;
+    std::vector<Done> done;
+    while (queue_.pop_batch(batch, queue_.capacity())) {
+        done.clear();
+        {
+            // This thread is the only one that commits, and it takes jobs in
+            // queue (= seq) order, so commits are in seq order without a gate.
+            std::lock_guard lock(commit_mu_);
+            for (const auto& job : batch) {
+                const auto t0 = Clock::now();
+                RegistrationResult result =
+                    commit(job.seq, job.request, check_static(catalog_, job.request));
+                done.push_back(Done{std::move(result), micros_since(t0)});
+            }
+        }
+        if (options_.verbose) {
+            log("[commit ] seq=" + std::to_string(batch.front().seq) + ".." +
+                std::to_string(batch.back().seq) + " batch=" + std::to_string(batch.size()));
+        }
+        // Deliver the results outside the lock.
+        for (std::size_t i = 0; i < batch.size(); ++i) {
+            if (batch[i].on_done) batch[i].on_done(done[i].result, done[i].us);
+        }
+    }
+}
+
 RegistrationResult ConcurrentEngine::commit(std::uint64_t seq, const RegistrationRequest& req,
                                             Reason static_verdict) {
     RegistrationResult result = decide_and_commit(catalog_, state_, seq, req, static_verdict);
@@ -104,12 +143,20 @@ RegistrationState ConcurrentEngine::state() const {
         std::lock_guard lock(admission_mu_);
         return state_;
     }
+    if (committer_mode()) {
+        std::lock_guard lock(commit_mu_);
+        return state_;
+    }
     return gate_.inspect([&] { return state_; });
 }
 
 std::vector<RegistrationResult> ConcurrentEngine::results() const {
     if (options_.workers == 0) {
         std::lock_guard lock(admission_mu_);
+        return results_;
+    }
+    if (committer_mode()) {
+        std::lock_guard lock(commit_mu_);
         return results_;
     }
     return gate_.inspect([&] { return results_; });

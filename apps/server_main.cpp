@@ -1,9 +1,11 @@
 // ffcsync_server - the registration server process.
 //
 //   ffcsync_server [--data DIR] [--socket PATH] [--workers N] [--queue-capacity Q]
-//                  [--out DIR] [--verbose]
+//                  [--mode gate|committer] [--out DIR] [--verbose]
 //
 //   --workers 0 runs the sequential server (requests processed inline).
+//   --mode committer replaces the worker pool + commit gate with one batched
+//   committer thread (any --workers N > 0 then starts just that one thread).
 // Stops gracefully on SIGINT / SIGTERM; exits 1 if an invariant is violated.
 #include <csignal>
 #include <iostream>
@@ -34,6 +36,12 @@ int main(int argc, char** argv) {
         opts.engine.workers = static_cast<int>(args.get_int("workers", 4));
         opts.engine.queue_capacity = static_cast<std::size_t>(args.get_int("queue-capacity", 64));
         opts.engine.verbose = args.has("verbose");
+        const std::string mode = args.get("mode", "gate");
+        if (mode == "committer") {
+            opts.engine.mode = CommitMode::Committer;
+        } else if (mode != "gate") {
+            cli::Args::fail("--mode must be gate or committer");
+        }
         opts.out_dir = args.get("out", "");
         if (opts.engine.workers < 0) cli::Args::fail("--workers must be >= 0");
         if (opts.engine.queue_capacity == 0) cli::Args::fail("--queue-capacity must be > 0");
@@ -50,7 +58,8 @@ int main(int argc, char** argv) {
         std::signal(SIGPIPE, SIG_IGN);
 
         std::cout << "ffcsync_server listening on " << opts.socket_path << " (workers="
-                  << opts.engine.workers << ", queue=" << opts.engine.queue_capacity << ")"
+                  << opts.engine.workers << ", mode=" << to_string(opts.engine.mode)
+                  << ", queue=" << opts.engine.queue_capacity << ")"
                   << std::endl;
         server.run();
         g_server = nullptr;

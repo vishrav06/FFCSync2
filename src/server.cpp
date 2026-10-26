@@ -167,6 +167,7 @@ void Server::write_outputs() const {
     auto summary = [&](std::ostream& o) {
         write_summary(o, results);
         o << "workers: " << options_.engine.workers << "\n"
+          << "mode: " << to_string(options_.engine.mode) << "\n"
           << "queue_capacity: " << options_.engine.queue_capacity << "\n"
           << "queue_high_water: " << engine_.queue_high_water() << "\n";
         for (const auto& v : violations) o << "INVARIANT VIOLATION: " << v << "\n";

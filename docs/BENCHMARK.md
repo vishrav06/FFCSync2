@@ -48,6 +48,37 @@ Environment (`results/bench/environment.txt`): WSL2 on Linux 6.6.87, AMD Ryzen 5
 
 ![throughput](../results/bench/throughput.png)
 
+### Single-committer mode (2026-10-26, same machine and settings)
+
+`bench.py` now also measures `--mode committer` (on by default; `--no-committer` turns it off). It is a fresh run, so the other rows differ slightly from the table above because of run-to-run variation.
+
+| requests | mode | workers | throughput (req/s) | avg latency (µs) | p95 latency (µs) | correct (all reps) |
+|---|---|---|---|---|---|---|
+| 1000 | server | 0 | 102,668 | 1,074 | 1,842 | yes |
+| 1000 | server | 1 | 103,097 | 1,008 | 2,320 | yes |
+| 1000 | server | 2 | 85,375 | 1,336 | 2,933 | yes |
+| 1000 | server | 4 | 52,069 | 3,053 | 5,694 | yes |
+| 1000 | server | committer | 98,438 | 998 | 2,377 | yes |
+| 10000 | server | 0 | 146,958 | 1,380 | 2,568 | yes |
+| 10000 | server | 1 | 136,751 | 1,519 | 3,949 | yes |
+| 10000 | server | 2 | 114,252 | 1,804 | 4,350 | yes |
+| 10000 | server | 4 | 57,068 | 3,951 | 8,529 | yes |
+| 10000 | server | committer | 164,593 | 1,200 | 3,270 | yes |
+
+A single client sending 5000 requests, swept over the client window (`--max-inflight`), average latency in µs:
+
+| server | window 1 | window 8 | window 64 |
+|---|---|---|---|
+| `--workers 0` (inline) | 109 | 94 | 444 |
+| `--workers 1` (gate) | 172 | 139 | 354 |
+| `--workers 4` (gate) | 174 | 216 | 836 |
+| `--mode committer` | 176 | 146 | 340 |
+
+- The committer was the fastest server configuration with 10,000 requests and 4 clients: about 12 % more throughput and 13 % lower average latency than inline. Its p95 was higher than inline's.
+- With 1,000 requests it was within run-to-run noise of `--workers 0` and `--workers 1`.
+- It is far better than the gate with 2 or 4 workers, because there is no `notify_all` thundering herd.
+- With a small client window it matches `--workers 1`: batches have size 1 and the reader → committer hand-off (~65 µs over inline here) remains. Inline is still the lowest-latency mode at low load.
+
 ## Interpretation (limited to these measurements)
 
 - **Every configuration was correct in every repetition.** No overselling, no invariant violation, and results identical to the sequential replay.

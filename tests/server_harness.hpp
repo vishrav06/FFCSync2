@@ -21,9 +21,11 @@ inline std::string unique_socket_path() {
 
 class TestServer {
 public:
-    TestServer(const Catalog& catalog, int workers, std::size_t queue_capacity = 16)
+    TestServer(const Catalog& catalog, int workers, std::size_t queue_capacity = 16,
+               CommitMode mode = CommitMode::Gate)
         : path_(unique_socket_path()),
-          server_(catalog, ServerOptions{path_, EngineOptions{workers, queue_capacity, false}, {}}) {
+          server_(catalog,
+                  ServerOptions{path_, EngineOptions{workers, queue_capacity, false, mode}, {}}) {
         server_.start();
         thread_ = std::thread([this] { server_.run(); });
     }

@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # Two-process integration test with the real executables:
-#   server (4 workers) + three concurrent client processes
+#   server (4 workers, or the single committer) + three concurrent client processes
 #   -> stop with SIGTERM -> socket removed -> replay the admission log with
 #   the sequential oracle -> results and final state must be identical.
-# Usage: tests/integration.sh <build-dir> <source-dir>
+# Usage: tests/integration.sh <build-dir> <source-dir> [gate|committer]
 set -euo pipefail
 BUILD=$(cd "$1" && pwd)
 SRC=$(cd "$2" && pwd)
+MODE=${3:-gate}
 TMP=$(mktemp -d)
 SOCK="$TMP/ffcsync.sock"
 trap 'kill $SERVER_PID 2>/dev/null || true; rm -rf "$TMP"' EXIT
@@ -16,7 +17,7 @@ python3 -I scripts/gen_workload.py --n 600 --seed 11 --prefix A --out "$TMP/a.cs
 python3 -I scripts/gen_workload.py --n 600 --seed 12 --prefix B --out "$TMP/b.csv"
 python3 -I scripts/gen_workload.py --n 600 --seed 13 --prefix C --out "$TMP/c.csv"
 
-"$BUILD/ffcsync_server" --data data --socket "$SOCK" --workers 4 --queue-capacity 8 \
+"$BUILD/ffcsync_server" --data data --socket "$SOCK" --workers 4 --queue-capacity 8 --mode "$MODE" \
     --out "$TMP/server" > "$TMP/server.log" &
 SERVER_PID=$!
 for _ in $(seq 100); do [ -S "$SOCK" ] && break; sleep 0.05; done
@@ -39,4 +40,4 @@ diff "$TMP/server/final_state.csv" "$TMP/oracle/final_state.csv"
 
 total=$(($(wc -l < "$TMP/server/results.csv") - 1))
 [ "$total" -eq 1800 ] || { echo "expected 1800 results, got $total"; exit 1; }
-echo "integration OK: 1800 requests from 3 client processes match the sequential replay"
+echo "integration OK ($MODE): 1800 requests from 3 client processes match the sequential replay"
