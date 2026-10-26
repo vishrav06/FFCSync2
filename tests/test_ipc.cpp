@@ -3,6 +3,7 @@
 #include <unistd.h>
 
 #include <filesystem>
+#include <map>
 #include <thread>
 
 #include "doctest.h"
@@ -82,6 +83,73 @@ TEST_CASE("oversized frames and truncated frames are reported") {
     }
 }
 
+TEST_CASE("FrameReader hands out every frame from one read and survives byte-wise writes") {
+    {
+        SocketPair sp;
+        std::string bytes = frame_bytes("one") + frame_bytes("") + frame_bytes("three");
+        bytes += frame_bytes("four").substr(0, 5);   // partial frame at the end
+        REQUIRE(::write(sp.a, bytes.data(), bytes.size()) == static_cast<ssize_t>(bytes.size()));
+        ipc::FrameReader in(sp.b);
+        std::string p;
+        CHECK_FALSE(in.has_frame());   // nothing read yet
+        REQUIRE(in.next(p) == ipc::ReadStatus::Ok);
+        CHECK(p == "one");
+        CHECK(in.has_frame());   // the rest arrived in the same read
+        REQUIRE(in.next(p) == ipc::ReadStatus::Ok);
+        CHECK(p.empty());
+        REQUIRE(in.next(p) == ipc::ReadStatus::Ok);
+        CHECK(p == "three");
+        CHECK_FALSE(in.has_frame());   // only a partial frame is buffered
+        const std::string rest = frame_bytes("four").substr(5);
+        REQUIRE(::write(sp.a, rest.data(), rest.size()) == static_cast<ssize_t>(rest.size()));
+        REQUIRE(in.next(p) == ipc::ReadStatus::Ok);
+        CHECK(p == "four");
+        ::close(sp.a);
+        sp.a = -1;
+        CHECK(in.next(p) == ipc::ReadStatus::Closed);
+    }
+    {
+        SocketPair sp;
+        const std::string bytes = frame_bytes("hello") + frame_bytes("world!");
+        std::thread writer([&] {
+            for (char c : bytes) REQUIRE(::write(sp.a, &c, 1) == 1);
+            ::close(sp.a);
+            sp.a = -1;
+        });
+        ipc::FrameReader in(sp.b, 3);   // tiny chunks: frames always span reads
+        std::string p;
+        CHECK(in.next(p) == ipc::ReadStatus::Ok);
+        CHECK(p == "hello");
+        CHECK(in.next(p) == ipc::ReadStatus::Ok);
+        CHECK(p == "world!");
+        CHECK(in.next(p) == ipc::ReadStatus::Closed);
+        writer.join();
+    }
+}
+
+TEST_CASE("FrameReader reports oversized and truncated frames") {
+    {
+        SocketPair sp;
+        const std::string bytes = frame_bytes("ok") + std::string{0, 0, 0x10, 0};
+        REQUIRE(::write(sp.a, bytes.data(), bytes.size()) == static_cast<ssize_t>(bytes.size()));
+        ipc::FrameReader in(sp.b);
+        std::string p;
+        CHECK(in.next(p) == ipc::ReadStatus::Ok);
+        CHECK(in.has_frame());   // next() will not block: it reports TooLarge
+        CHECK(in.next(p) == ipc::ReadStatus::TooLarge);
+    }
+    {
+        SocketPair sp;
+        const std::string partial = frame_bytes("abcdef").substr(0, 7);
+        REQUIRE(::write(sp.a, partial.data(), partial.size()) == 7);
+        ::close(sp.a);
+        sp.a = -1;
+        ipc::FrameReader in(sp.b);
+        std::string p;
+        CHECK(in.next(p) == ipc::ReadStatus::Error);
+    }
+}
+
 TEST_CASE("request and response codec") {
     RegistrationRequest req{"r-1", Op::Drop, "S001", "CSE2005-A1"};
     auto back = ipc::decode_request(ipc::encode_request(req));
@@ -107,13 +175,15 @@ TEST_CASE("request and response codec") {
 }
 
 TEST_CASE("server answers every request with the oracle's result") {
-    for (int workers : {0, 2}) {
+    for (auto [workers, mode] : {std::pair{0, CommitMode::Gate}, std::pair{2, CommitMode::Gate},
+                                 std::pair{1, CommitMode::Committer}}) {
         CAPTURE(workers);
+        CAPTURE(to_string(mode));
         auto requests = load_requests(data_dir() / "workloads" / "basic.csv");
         RegistrationEngine oracle(catalog());
         auto expected = oracle.run(requests);
 
-        TestServer ts(catalog(), workers);
+        TestServer ts(catalog(), workers, 16, mode);
         TestClient c(ts.path());
         REQUIRE(c.ok());
         for (std::size_t i = 0; i < requests.size(); ++i) {
@@ -127,6 +197,49 @@ TEST_CASE("server answers every request with the oracle's result") {
         ts.stop();
         CHECK(ts.server().engine().state() == oracle.state());
         CHECK(ts.server().invariant_violations().empty());
+    }
+}
+
+TEST_CASE("pipelined requests sent in one write are answered like the oracle") {
+    // The whole workload (plus a malformed message) arrives in a single write,
+    // so the server admits it as one batch and, in committer mode, answers
+    // with batched writes.
+    for (auto [workers, mode] : {std::pair{0, CommitMode::Gate}, std::pair{2, CommitMode::Gate},
+                                 std::pair{1, CommitMode::Committer}}) {
+        CAPTURE(workers);
+        CAPTURE(to_string(mode));
+        auto requests = load_requests(data_dir() / "workloads" / "basic.csv");
+        RegistrationEngine oracle(catalog());
+        std::map<std::string, RegistrationResult> expected;
+        for (const auto& r : oracle.run(requests)) expected[r.request.request_id] = r;
+
+        TestServer ts(catalog(), workers, 4, mode);   // batch larger than the queue
+        TestClient c(ts.path());
+        REQUIRE(c.ok());
+        std::string bytes;
+        for (std::size_t i = 0; i < requests.size(); ++i) {
+            if (i == 3) ipc::append_frame(bytes, "REQ|bad|JOIN|S001|CSE2005-A1");
+            ipc::append_frame(bytes, ipc::encode_request(requests[i]));
+        }
+        REQUIRE(ipc::write_all(c.fd(), bytes));
+
+        ipc::FrameReader in(c.fd());
+        std::string p;
+        for (std::size_t i = 0; i < requests.size() + 1; ++i) {
+            REQUIRE(in.next(p) == ipc::ReadStatus::Ok);
+            auto resp = ipc::decode_response(p);
+            REQUIRE(resp);
+            if (resp->request_id == "bad") {
+                CHECK(resp->seq == 0);
+                CHECK(resp->reason == Reason::Malformed);
+                continue;
+            }
+            const auto& e = expected.at(resp->request_id);
+            CHECK(resp->seq == e.seq);
+            CHECK(resp->reason == e.reason);
+        }
+        ts.stop();
+        CHECK(ts.server().engine().state() == oracle.state());
     }
 }
 
@@ -159,9 +272,11 @@ TEST_CASE("oversized frame gets MALFORMED and the connection is closed") {
 }
 
 TEST_CASE("client disconnect does not break the server") {
-    for (int workers : {0, 2}) {
+    for (auto [workers, mode] : {std::pair{0, CommitMode::Gate}, std::pair{2, CommitMode::Gate},
+                                 std::pair{1, CommitMode::Committer}}) {
         CAPTURE(workers);
-        TestServer ts(catalog(), workers);
+        CAPTURE(to_string(mode));
+        TestServer ts(catalog(), workers, 16, mode);
         {
             TestClient c(ts.path());
             // Send without reading the response, then vanish.

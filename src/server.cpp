@@ -27,9 +27,24 @@ struct Server::Connection {
         return ipc::write_frame(fd, payload);
     }
 
+    // Committer mode: appends every reply of a batch to `outbox`, then sends
+    // the whole outbox with one write. Only the committer thread touches
+    // outbox/queued; the write itself still takes write_mu, because a reader
+    // thread may be answering a malformed message on the same socket.
+    void flush() {
+        {
+            std::lock_guard lock(write_mu);
+            ipc::write_all(fd, outbox);   // a disconnected client is ignored (EPIPE)
+        }
+        outbox.clear();
+        queued = false;
+    }
+
     const int fd;
     const std::uint64_t id;
     std::mutex write_mu;
+    std::string outbox;
+    bool queued = false;
 };
 
 namespace {
@@ -45,7 +60,9 @@ ipc::Response response_for(const RegistrationResult& r, std::uint64_t us) {
 }  // namespace
 
 Server::Server(const Catalog& catalog, ServerOptions options)
-    : catalog_(catalog), options_(std::move(options)), engine_(catalog, options_.engine) {
+    : catalog_(catalog),
+      options_(std::move(options)),
+      engine_(catalog, options_.engine, [this] { flush_replies(); }) {
     if (::pipe2(stop_pipe_, O_CLOEXEC | O_NONBLOCK) < 0) throw sys_error("pipe2");
 }
 
@@ -128,33 +145,68 @@ void Server::run() {
 }
 
 void Server::reader_loop(std::shared_ptr<Connection> conn) {
+    // Reads the socket in large chunks; every complete frame that arrived
+    // together is decoded and admitted as one batch (consecutive seqs, in
+    // stream order, one acquisition of the admission mutex).
+    ipc::FrameReader in(conn->fd);
+    const Completion on_done = reply_to(conn);
+    std::vector<RegistrationRequest> batch;
     std::string payload;
-    while (true) {
-        ipc::ReadStatus st = ipc::read_frame(conn->fd, payload);
-        if (st == ipc::ReadStatus::Closed || st == ipc::ReadStatus::Error) break;
-        if (st == ipc::ReadStatus::TooLarge) {
-            // The rest of the stream cannot be framed reliably: answer and disconnect.
-            conn->send(ipc::encode_response({"?", 0, Status::Rejected, Reason::Malformed, 0}));
-            break;
-        }
-        auto req = ipc::decode_request(payload);
-        if (!req) {
-            // Rejected before admission: no sequence number, state untouched.
-            if (options_.engine.verbose) {
-                std::cerr << "[server] client " << conn->id << " sent a malformed message (no seq)\n";
+    bool open = true;
+    while (open) {
+        batch.clear();
+        do {
+            ipc::ReadStatus st = in.next(payload);
+            if (st == ipc::ReadStatus::Closed || st == ipc::ReadStatus::Error) {
+                open = false;
+                break;
             }
-            conn->send(ipc::encode_response(
-                {ipc::guess_request_id(payload), 0, Status::Rejected, Reason::Malformed, 0}));
-            continue;
-        }
-        // The completion callback keeps the connection alive until the
-        // response is written, even if the client has already disconnected.
-        auto seq = engine_.submit(*req, [conn](const RegistrationResult& r, std::uint64_t us) {
-            conn->send(ipc::encode_response(response_for(r, us)));
-        });
-        if (seq == 0) break;   // engine shut down
+            if (st == ipc::ReadStatus::TooLarge) {
+                // The rest of the stream cannot be framed reliably: answer and disconnect.
+                conn->send(ipc::encode_response({"?", 0, Status::Rejected, Reason::Malformed, 0}));
+                open = false;
+                break;
+            }
+            auto req = ipc::decode_request(payload);
+            if (!req) {
+                // Rejected before admission: no sequence number, state untouched.
+                if (options_.engine.verbose) {
+                    std::cerr << "[server] client " << conn->id
+                              << " sent a malformed message (no seq)\n";
+                }
+                conn->send(ipc::encode_response(
+                    {ipc::guess_request_id(payload), 0, Status::Rejected, Reason::Malformed, 0}));
+                continue;
+            }
+            batch.push_back(std::move(*req));
+        } while (in.has_frame());
+        // Requests read before a disconnect are still admitted.
+        if (!batch.empty() && engine_.submit_batch(batch, on_done) == 0) break;   // engine shut down
     }
     if (options_.engine.verbose) std::cerr << "[server] client " << conn->id << " disconnected\n";
+}
+
+// The completion keeps the connection alive until the response is written,
+// even if the client has already disconnected.
+Completion Server::reply_to(std::shared_ptr<Connection> conn) {
+    if (options_.engine.workers > 0 && options_.engine.mode == CommitMode::Committer) {
+        // Runs on the committer thread: buffer, flushed by flush_replies().
+        return [this, conn](const RegistrationResult& r, std::uint64_t us) {
+            ipc::append_frame(conn->outbox, ipc::encode_response(response_for(r, us)));
+            if (!conn->queued) {
+                conn->queued = true;
+                pending_replies_.push_back(conn);
+            }
+        };
+    }
+    return [conn](const RegistrationResult& r, std::uint64_t us) {
+        conn->send(ipc::encode_response(response_for(r, us)));
+    };
+}
+
+void Server::flush_replies() {
+    for (auto& conn : pending_replies_) conn->flush();
+    pending_replies_.clear();
 }
 
 std::vector<std::string> Server::invariant_violations() const {
@@ -167,6 +219,7 @@ void Server::write_outputs() const {
     auto summary = [&](std::ostream& o) {
         write_summary(o, results);
         o << "workers: " << options_.engine.workers << "\n"
+          << "mode: " << to_string(options_.engine.mode) << "\n"
           << "queue_capacity: " << options_.engine.queue_capacity << "\n"
           << "queue_high_water: " << engine_.queue_high_water() << "\n";
         for (const auto& v : violations) o << "INVARIANT VIOLATION: " << v << "\n";

@@ -1,5 +1,28 @@
+# Build output
 build/
 build-*/
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+compile_commands.json
+
+# Python
 .venv/
-results/
 __pycache__/
+*.pyc
+
+# Generated results
+results/
+
+# Archives
+*.zip
+
+# Claude Code
+CLAUDE.md
+.claude/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store

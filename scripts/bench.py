@@ -6,6 +6,7 @@ split across --clients client processes. Configurations measured:
 
   * sequential_engine : ffcsync_seq run (in-process, no IPC) - the reference
   * server, workers=W : ffcsync_server --workers W (W=0 is the sequential server)
+  * server, committer : ffcsync_server --mode committer (one batched committer thread)
 
 Every server run is checked for correctness BEFORE its numbers are kept:
 the server's admission log is replayed through ffcsync_seq and the results
@@ -79,11 +80,13 @@ def bench_sequential(build, combined, tmp):
 
 
 def bench_server(build, workers, queue, client_files, tmp):
+    committer = workers == "committer"
     sock = tmp / "bench.sock"
     srv_out = tmp / f"srv_w{workers}"
     shutil.rmtree(srv_out, ignore_errors=True)
     server = subprocess.Popen([str(build / "ffcsync_server"), "--data", str(ROOT / "data"),
-                               "--socket", str(sock), "--workers", str(workers),
+                               "--socket", str(sock), "--workers", "1" if committer else str(workers),
+                               "--mode", "committer" if committer else "gate",
                                "--queue-capacity", str(queue), "--out", str(srv_out)],
                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
@@ -153,6 +156,8 @@ def main():
     p.add_argument("--build", default=str(ROOT / "build"))
     p.add_argument("--sizes", type=int, nargs="+", default=[1000, 10000])
     p.add_argument("--workers", type=int, nargs="+", default=[0, 1, 2, 4])
+    p.add_argument("--committer", action=argparse.BooleanOptionalAction, default=True,
+                   help="also measure --mode committer (shown as workers=committer)")
     p.add_argument("--clients", type=int, default=4)
     p.add_argument("--queue-capacity", type=int, default=64)
     p.add_argument("--reps", type=int, default=3)
@@ -173,13 +178,15 @@ def main():
             client_files, combined = generate(n, a.clients, a.seed + n, tmp)
             for rep in range(1, a.reps + 1):
                 configs = [("sequential_engine", "")] + [("server", w) for w in a.workers]
+                if a.committer:
+                    configs.append(("server", "committer"))
                 for mode, w in configs:
                     m = (bench_sequential(build, combined, tmp) if mode == "sequential_engine"
                          else bench_server(build, w, a.queue_capacity, client_files, tmp))
                     row = {"mode": mode, "workers": w, "requests": n, "clients": a.clients if mode == "server" else 1,
                            "rep": rep, **m}
                     rows.append(row)
-                    print(f"n={n:6d} rep={rep} {mode:17s} workers={str(w):2s} "
+                    print(f"n={n:6d} rep={rep} {mode:17s} workers={str(w):9s} "
                           f"throughput={row['throughput_rps']:>10} rps  p95={row['p95_latency_us']!s:>6} us  "
                           f"correct={row['matches_oracle']} invariants={row['invariants_ok']}", flush=True)
 

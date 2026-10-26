@@ -1,5 +1,5 @@
 // Client <-> server protocol over a Unix domain stream socket.
-// Full description: docs/IPC_PROTOCOL.md
+// Wire format: see README.md ("Wire format")
 //
 // Framing: every message is a 4-byte big-endian payload length followed by
 // that many bytes of ASCII payload (max kMaxPayload). A stream socket may
@@ -31,6 +31,31 @@ enum class ReadStatus {
 
 ReadStatus read_frame(int fd, std::string& payload);
 bool write_frame(int fd, std::string_view payload);   // false on error / disconnected peer
+
+// Appends one frame (length prefix + payload) to `out`, so several frames can
+// be sent with a single write_all(). Precondition: payload.size() <= kMaxPayload.
+void append_frame(std::string& out, std::string_view payload);
+bool write_all(int fd, std::string_view bytes);       // false on error / disconnected peer
+
+// Buffered frame reader for one stream socket. read_frame() costs two read()
+// calls per frame; FrameReader reads up to `chunk` bytes at a time and hands
+// out every complete frame already buffered without another system call.
+// Same ReadStatus meanings as read_frame().
+class FrameReader {
+public:
+    explicit FrameReader(int fd, std::size_t chunk = 64 * 1024) : fd_(fd), chunk_(chunk) {}
+
+    // Blocks (reads the socket) only if no complete frame is buffered.
+    ReadStatus next(std::string& payload);
+    // True if next() can return without reading the socket.
+    bool has_frame() const;
+
+private:
+    int fd_;
+    std::size_t chunk_;
+    std::string buf_;
+    std::size_t pos_ = 0;   // start of the first unconsumed byte in buf_
+};
 
 struct Response {
     std::string request_id;

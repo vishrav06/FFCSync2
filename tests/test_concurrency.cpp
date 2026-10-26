@@ -3,7 +3,8 @@
 // Strategy: many threads submit concurrently, so the admission order is
 // nondeterministic. The engine records that order (seq numbers). Replaying
 // it through the sequential RegistrationEngine must reproduce exactly the
-// same per-request results and the same final state, for every worker count.
+// same per-request results and the same final state, for every engine
+// configuration (inline, gate with N workers, single committer).
 #include <latch>
 #include <map>
 #include <random>
@@ -21,7 +22,20 @@ using namespace ffcsync::test;
 
 namespace {
 
-constexpr int kWorkerCounts[] = {0, 1, 2, 4, 8};
+struct EngineConfig {
+    int workers;
+    CommitMode mode;
+};
+constexpr EngineConfig kConfigs[] = {{0, CommitMode::Gate},
+                               {1, CommitMode::Gate},
+                               {2, CommitMode::Gate},
+                               {4, CommitMode::Gate},
+                               {8, CommitMode::Gate},
+                               {1, CommitMode::Committer}};
+
+EngineOptions options_for(const EngineConfig& c, std::size_t queue_capacity) {
+    return EngineOptions{c.workers, queue_capacity, false, c.mode};
+}
 
 // Submits each list of requests from its own thread, all starting together.
 // Returns the results delivered to the completion callbacks, keyed by seq.
@@ -79,10 +93,11 @@ TEST_CASE("students racing for the last seat: exactly one wins, the earliest seq
     // All of these students satisfy the CSE2005 prerequisite. CSE2005-B1 has 1 seat.
     const std::vector<std::string> students = {"S001", "S002", "S004", "S006",
                                                "S007", "S009", "S010", "S011"};
-    for (int workers : kWorkerCounts) {
-        CAPTURE(workers);
+    for (const EngineConfig& cfg : kConfigs) {
+        CAPTURE(cfg.workers);
+        CAPTURE(to_string(cfg.mode));
         for (int rep = 0; rep < 100; ++rep) {
-            ConcurrentEngine engine(catalog(), EngineOptions{workers, 4, false});
+            ConcurrentEngine engine(catalog(), options_for(cfg, 4));
             std::vector<std::vector<RegistrationRequest>> per_thread;
             for (const auto& s : students) per_thread.push_back({add(s, "CSE2005-B1", s)});
             auto delivered = submit_concurrently(engine, per_thread);
@@ -104,10 +119,11 @@ TEST_CASE("students racing for the last seat: exactly one wins, the earliest seq
 }
 
 TEST_CASE("conflicting requests from the same student") {
-    for (int workers : kWorkerCounts) {
-        CAPTURE(workers);
+    for (const EngineConfig& cfg : kConfigs) {
+        CAPTURE(cfg.workers);
+        CAPTURE(to_string(cfg.mode));
         for (int rep = 0; rep < 50; ++rep) {
-            ConcurrentEngine engine(catalog(), EngineOptions{workers, 4, false});
+            ConcurrentEngine engine(catalog(), options_for(cfg, 4));
             // Thread 0: an ordered sequence for S004 whose outcomes depend on each other.
             // Threads 1-2: S004 again, two clashing ADDs racing each other (slot B1),
             //              while other students register in unrelated sections.
@@ -148,11 +164,13 @@ TEST_CASE("randomised workloads match the sequential reference") {
     std::vector<SectionId> sections;
     for (const auto& [id, s] : catalog().sections) sections.push_back(id);
 
-    for (int workers : kWorkerCounts) {
-        CAPTURE(workers);
+    for (const EngineConfig& cfg : kConfigs) {
+        CAPTURE(cfg.workers);
+        CAPTURE(to_string(cfg.mode));
         for (unsigned rep = 0; rep < 200; ++rep) {
             CAPTURE(rep);
-            std::mt19937 rng(rep * 7919u + static_cast<unsigned>(workers));
+            std::mt19937 rng(rep * 7919u + static_cast<unsigned>(cfg.workers) +
+                             (cfg.mode == CommitMode::Committer ? 100u : 0u));
             constexpr int kThreads = 6, kPerThread = 50;
             std::vector<std::vector<RegistrationRequest>> per_thread(kThreads);
             for (int t = 0; t < kThreads; ++t) {
@@ -165,8 +183,63 @@ TEST_CASE("randomised workloads match the sequential reference") {
                     per_thread[t].push_back(r);
                 }
             }
-            ConcurrentEngine engine(catalog(), EngineOptions{workers, 8, false});
+            ConcurrentEngine engine(catalog(), options_for(cfg, 8));
             auto delivered = submit_concurrently(engine, per_thread);
+            check_matches_oracle(engine, delivered);
+        }
+    }
+}
+
+TEST_CASE("batched submissions get consecutive seqs and match the sequential reference") {
+    std::vector<StudentId> students;
+    for (const auto& [id, s] : catalog().students) students.push_back(id);
+    std::vector<SectionId> sections;
+    for (const auto& [id, s] : catalog().sections) sections.push_back(id);
+
+    for (const EngineConfig& cfg : kConfigs) {
+        CAPTURE(cfg.workers);
+        CAPTURE(to_string(cfg.mode));
+        for (unsigned rep = 0; rep < 50; ++rep) {
+            CAPTURE(rep);
+            std::mt19937 rng(rep * 104729u + static_cast<unsigned>(cfg.workers));
+            ConcurrentEngine engine(catalog(), options_for(cfg, 8));
+            std::mutex mu;
+            std::map<std::uint64_t, RegistrationResult> delivered;
+            std::vector<std::vector<std::vector<RegistrationRequest>>> batches(4);
+            for (unsigned t = 0; t < batches.size(); ++t) {
+                for (int b = 0; b < 10; ++b) {
+                    std::vector<RegistrationRequest> batch(1 + rng() % 20);   // may exceed capacity
+                    for (std::size_t i = 0; i < batch.size(); ++i) {
+                        batch[i] = RegistrationRequest{
+                            std::to_string(t) + "-" + std::to_string(b) + "-" + std::to_string(i),
+                            rng() % 4 == 0 ? Op::Drop : Op::Add, students[rng() % students.size()],
+                            sections[rng() % sections.size()]};
+                    }
+                    batches[t].push_back(std::move(batch));
+                }
+            }
+            std::latch start(static_cast<std::ptrdiff_t>(batches.size()));
+            std::vector<std::thread> threads;
+            for (const auto& mine : batches) {
+                threads.emplace_back([&, &mine = mine] {
+                    start.arrive_and_wait();
+                    for (const auto& batch : mine) {
+                        const auto first = engine.submit_batch(
+                            batch, [&](const RegistrationResult& res, std::uint64_t) {
+                                std::lock_guard lock(mu);
+                                CHECK(delivered.emplace(res.seq, res).second);
+                            });
+                        REQUIRE(first > 0);
+                        // The batch occupies first .. first+size-1 in span order.
+                        const auto admitted = engine.admissions();
+                        for (std::size_t i = 0; i < batch.size(); ++i) {
+                            CHECK(admitted[first - 1 + i].request.request_id == batch[i].request_id);
+                        }
+                    }
+                });
+            }
+            for (auto& t : threads) t.join();
+            engine.shutdown();
             check_matches_oracle(engine, delivered);
         }
     }

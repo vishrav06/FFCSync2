@@ -72,6 +72,12 @@ std::optional<std::uint64_t> parse_u64(std::string_view s) {
     return v;
 }
 
+std::uint32_t decode_length(const char* p) {
+    const auto* h = reinterpret_cast<const unsigned char*>(p);
+    return (std::uint32_t{h[0]} << 24) | (std::uint32_t{h[1]} << 16) | (std::uint32_t{h[2]} << 8) |
+           std::uint32_t{h[3]};
+}
+
 sockaddr_un make_addr(const std::string& path, bool& ok) {
     sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
@@ -83,12 +89,11 @@ sockaddr_un make_addr(const std::string& path, bool& ok) {
 }  // namespace
 
 ReadStatus read_frame(int fd, std::string& payload) {
-    unsigned char hdr[4];
-    ssize_t r = read_full(fd, reinterpret_cast<char*>(hdr), sizeof hdr);
+    char hdr[4];
+    ssize_t r = read_full(fd, hdr, sizeof hdr);
     if (r == 0) return ReadStatus::Closed;
     if (r < 0) return ReadStatus::Error;
-    std::uint32_t len = (std::uint32_t{hdr[0]} << 24) | (std::uint32_t{hdr[1]} << 16) |
-                        (std::uint32_t{hdr[2]} << 8) | std::uint32_t{hdr[3]};
+    const std::uint32_t len = decode_length(hdr);
     if (len > kMaxPayload) return ReadStatus::TooLarge;
     payload.resize(len);
     if (len > 0 && read_full(fd, payload.data(), len) != static_cast<ssize_t>(len)) {
@@ -99,16 +104,55 @@ ReadStatus read_frame(int fd, std::string& payload) {
 
 bool write_frame(int fd, std::string_view payload) {
     if (payload.size() > kMaxPayload) return false;
-    const auto len = static_cast<std::uint32_t>(payload.size());
-    std::string frame(4 + payload.size(), '\0');
-    frame[0] = static_cast<char>((len >> 24) & 0xff);
-    frame[1] = static_cast<char>((len >> 16) & 0xff);
-    frame[2] = static_cast<char>((len >> 8) & 0xff);
-    frame[3] = static_cast<char>(len & 0xff);
-    std::memcpy(frame.data() + 4, payload.data(), payload.size());
+    std::string frame;
+    append_frame(frame, payload);
     // One send per frame keeps frames contiguous when several threads write
     // to the same socket under a per-connection mutex.
     return write_full(fd, frame.data(), frame.size());
+}
+
+void append_frame(std::string& out, std::string_view payload) {
+    const auto len = static_cast<std::uint32_t>(payload.size());
+    const char hdr[4] = {static_cast<char>((len >> 24) & 0xff), static_cast<char>((len >> 16) & 0xff),
+                         static_cast<char>((len >> 8) & 0xff), static_cast<char>(len & 0xff)};
+    out.append(hdr, sizeof hdr);
+    out.append(payload);
+}
+
+bool write_all(int fd, std::string_view bytes) { return write_full(fd, bytes.data(), bytes.size()); }
+
+bool FrameReader::has_frame() const {
+    const std::size_t avail = buf_.size() - pos_;
+    if (avail < 4) return false;
+    const std::uint32_t len = decode_length(buf_.data() + pos_);
+    return len > kMaxPayload || avail >= 4 + len;
+}
+
+ReadStatus FrameReader::next(std::string& payload) {
+    while (true) {
+        const std::size_t avail = buf_.size() - pos_;
+        if (avail >= 4) {
+            const std::uint32_t len = decode_length(buf_.data() + pos_);
+            if (len > kMaxPayload) return ReadStatus::TooLarge;
+            if (avail >= 4 + len) {
+                payload.assign(buf_, pos_ + 4, len);
+                pos_ += 4 + len;
+                return ReadStatus::Ok;
+            }
+        }
+        // Not a complete frame yet: keep the partial bytes and read more.
+        buf_.erase(0, pos_);
+        pos_ = 0;
+        const std::size_t old = buf_.size();
+        buf_.resize(old + chunk_);
+        const ssize_t r = ::read(fd_, buf_.data() + old, chunk_);
+        buf_.resize(old + (r > 0 ? static_cast<std::size_t>(r) : 0));
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            return ReadStatus::Error;
+        }
+        if (r == 0) return buf_.empty() ? ReadStatus::Closed : ReadStatus::Error;
+    }
 }
 
 std::string encode_request(const RegistrationRequest& req) {

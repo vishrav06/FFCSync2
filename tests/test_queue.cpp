@@ -89,11 +89,64 @@ TEST_CASE("close drains remaining items, then wakes and releases everyone") {
     consumer.join();
 }
 
+TEST_CASE("pop_batch takes up to max items in FIFO order") {
+    BoundedQueue<int> q(8);
+    for (int i = 0; i < 5; ++i) q.push(i);
+    std::vector<int> batch{99};   // stale contents are cleared
+    REQUIRE(q.pop_batch(batch, 3));
+    CHECK(batch == std::vector<int>{0, 1, 2});
+    REQUIRE(q.pop_batch(batch, 8));
+    CHECK(batch == std::vector<int>{3, 4});   // only what is queued, no waiting for more
+    CHECK(q.size() == 0);
+}
+
+TEST_CASE("pop_batch releases blocked producers and drains after close") {
+    BoundedQueue<int> q(2);
+    q.push(1);
+    q.push(2);
+    std::atomic<int> pushed{0};
+    std::vector<std::thread> producers;
+    for (int i = 3; i <= 4; ++i) {
+        producers.emplace_back([&, i] {
+            q.push(i);
+            ++pushed;
+        });
+    }
+    std::this_thread::sleep_for(50ms);
+    CHECK(pushed == 0);   // both blocked: queue full
+    std::vector<int> batch;
+    REQUIRE(q.pop_batch(batch, 2));   // frees two slots at once: both producers must wake
+    CHECK(batch == std::vector<int>{1, 2});
+    for (auto& t : producers) t.join();
+    CHECK(pushed == 2);
+
+    q.close();
+    REQUIRE(q.pop_batch(batch, 8));   // admitted before close: still delivered
+    CHECK(batch.size() == 2);
+    CHECK_FALSE(q.pop_batch(batch, 8));
+    CHECK(batch.empty());
+
+    BoundedQueue<int> empty(1);
+    std::thread consumer([&] {
+        std::vector<int> b;
+        CHECK_FALSE(empty.pop_batch(b, 4));   // blocks: empty, then closed
+    });
+    std::this_thread::sleep_for(20ms);
+    empty.close();
+    consumer.join();
+}
+
 TEST_CASE("engine shutdown processes every admitted request and joins workers") {
-    for (int workers : {1, 2, 4, 8}) {
+    const std::pair<int, CommitMode> configs[] = {{1, CommitMode::Gate},
+                                                  {2, CommitMode::Gate},
+                                                  {4, CommitMode::Gate},
+                                                  {8, CommitMode::Gate},
+                                                  {1, CommitMode::Committer}};
+    for (const auto& [workers, mode] : configs) {
         CAPTURE(workers);
+        CAPTURE(to_string(mode));
         std::atomic<int> completed{0};
-        ConcurrentEngine engine(catalog(), EngineOptions{workers, 4, false});
+        ConcurrentEngine engine(catalog(), EngineOptions{workers, 4, false, mode});
         std::vector<std::thread> submitters;
         for (int t = 0; t < 4; ++t) {
             submitters.emplace_back([&, t] {

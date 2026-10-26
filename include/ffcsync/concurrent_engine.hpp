@@ -16,11 +16,18 @@
 // workers == 0 selects the sequential server mode (build-plan phase 3): the
 // request is processed inline in the calling thread while admission_mu_ is
 // held. No queue, no worker threads.
+//
+// CommitMode::Committer replaces the worker pool and the CommitGate with ONE
+// committer thread that owns the state. It takes every queued job at once
+// (pop_batch), commits them in queue order (= seq order), then sends the
+// replies. A single consumer of a FIFO queue cannot reorder, so no gate is
+// needed; batching amortises the wake-up cost over many requests.
 #pragma once
 
 #include <cstdint>
 #include <functional>
 #include <mutex>
+#include <span>
 #include <thread>
 #include <vector>
 
@@ -30,18 +37,30 @@
 
 namespace ffcsync {
 
+enum class CommitMode {
+    Gate,        // N worker threads, commits ordered by CommitGate
+    Committer,   // one committer thread, batched; `workers` (if > 0) is ignored
+};
+
 struct EngineOptions {
     int workers = 4;                  // 0 = sequential inline processing
     std::size_t queue_capacity = 64;
     bool verbose = false;             // per-request thread/queue log on stderr
+    CommitMode mode = CommitMode::Gate;
 };
+
+const char* to_string(CommitMode mode);
 
 // Called exactly once per admitted request, from the thread that committed it.
 using Completion = std::function<void(const RegistrationResult&, std::uint64_t server_us)>;
 
 class ConcurrentEngine {
 public:
-    ConcurrentEngine(const Catalog& catalog, EngineOptions options);
+    // on_batch_end (committer mode only): called by the committer thread after
+    // it has run the completion of every request in a batch, e.g. so the
+    // server can flush the replies it buffered during that batch.
+    ConcurrentEngine(const Catalog& catalog, EngineOptions options,
+                     std::function<void()> on_batch_end = {});
     ~ConcurrentEngine();
 
     ConcurrentEngine(const ConcurrentEngine&) = delete;
@@ -51,6 +70,11 @@ public:
     // the request, blocking while the queue is full. Returns the seq, or 0 if
     // the engine has been shut down (the request is then not processed).
     std::uint64_t submit(const RegistrationRequest& req, Completion on_done);
+
+    // Admits several requests under one acquisition of the admission mutex, so
+    // they receive consecutive seqs in span order. Each request gets its own
+    // copy of `on_done`. Returns the first seq, or 0 if shut down (or empty).
+    std::uint64_t submit_batch(std::span<const RegistrationRequest> reqs, const Completion& on_done);
 
     // Stops admission, lets the workers drain the queue, joins them. Idempotent.
     void shutdown();
@@ -70,11 +94,16 @@ private:
     };
 
     void worker_loop(int worker_id);
+    void committer_loop();
+    bool committer_mode() const {
+        return options_.workers > 0 && options_.mode == CommitMode::Committer;
+    }
     RegistrationResult commit(std::uint64_t seq, const RegistrationRequest& req, Reason static_verdict);
     void log(const std::string& line);
 
     const Catalog& catalog_;
     const EngineOptions options_;
+    const std::function<void()> on_batch_end_;
 
     mutable std::mutex admission_mu_;   // guards next_seq_, admissions_, closed_
     std::uint64_t next_seq_ = 1;
@@ -84,8 +113,13 @@ private:
     BoundedQueue<Job> queue_;
     CommitGate gate_;
 
-    // Mutable registration state. Guarded by gate_ (worker mode) or by
-    // admission_mu_ (inline mode). Never touched outside those.
+    // Held by the committer thread while it commits a batch, so snapshots
+    // taken concurrently see a consistent state (committer mode only).
+    mutable std::mutex commit_mu_;
+
+    // Mutable registration state. Guarded by gate_ (worker mode), by
+    // admission_mu_ (inline mode) or by commit_mu_ (committer mode).
+    // Never touched outside those.
     RegistrationState state_;
     std::vector<RegistrationResult> results_;
 

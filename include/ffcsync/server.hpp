@@ -7,6 +7,7 @@
 //                         calls ConcurrentEngine::submit() (the admission point)
 //   * worker thread x N - inside ConcurrentEngine; process and commit requests,
 //                         then write the response back on the client's socket
+//                         (committer mode: a single batched committer thread)
 //
 // Graceful shutdown (request_stop(), e.g. from SIGINT/SIGTERM):
 //   1. stop accepting: close and unlink the listening socket
@@ -61,10 +62,16 @@ private:
     struct Connection;
 
     void reader_loop(std::shared_ptr<Connection> conn);
+    Completion reply_to(std::shared_ptr<Connection> conn);
+    void flush_replies();
     void write_outputs() const;
 
     const Catalog& catalog_;
     const ServerOptions options_;
+    // Committer mode: connections with replies buffered during the current
+    // batch. Only the committer thread touches it (declared before engine_,
+    // whose committer thread uses it).
+    std::vector<std::shared_ptr<Connection>> pending_replies_;
     ConcurrentEngine engine_;
 
     int listen_fd_ = -1;
